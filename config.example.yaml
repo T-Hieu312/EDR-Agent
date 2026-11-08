@@ -1,0 +1,36 @@
+# Copy to config.yaml and customize for this machine.
+agent:
+  agent_id: ""
+  agent_key: ""
+
+collector:
+  channel: "Microsoft-Windows-Sysmon/Operational"
+  event_ids: [1, 3, 10, 11, 13, 22]
+  poll_interval: 2
+
+filters:
+  enabled: true
+  dedupe_window_seconds: 10
+  dedupe_cache_size: 10000
+  exclude_event_ids: []
+  keep_event_ids_when:
+    10:
+      TargetImage: ["\\lsass.exe"]
+  exclude_process_names: []
+  exclude_path_contains: []
+  exclude_data_contains: {}
+
+sender:
+  url: "http://127.0.0.1:8000/api/events/batch"
+  batch_size: 20
+  flush_interval: 3
+  max_retries: 3
+  timeout: 5
+
+storage:
+  queue_file: "spool.jsonl"
+  bookmark_file: "bookmark.xml"
+
+logging:
+  level: "INFO"
+  file: "edr_agent.log"
