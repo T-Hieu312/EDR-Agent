@@ -26,6 +26,7 @@ sender:
   flush_interval: 3
   max_retries: 3
   timeout: 5
+  max_spool_mb: 1024
 
 storage:
   queue_file: "spool.jsonl"

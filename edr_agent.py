@@ -65,7 +65,7 @@ def main():
         url=s["url"], agent_id=agent_id, agent_key=agent_key,
         queue_file=st["queue_file"], batch_size=s["batch_size"],
         flush_interval=s["flush_interval"], max_retries=s["max_retries"],
-        timeout=s["timeout"],
+        timeout=s["timeout"], max_spool_mb=s.get("max_spool_mb", 1024),
     )
     sender.start()
 

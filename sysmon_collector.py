@@ -10,6 +10,7 @@ Phụ thuộc: pywin32  (pip install pywin32) — chỉ chạy trên Windows.
 import os
 import time
 import logging
+import tempfile
 import xml.etree.ElementTree as ET
 
 try:
@@ -64,14 +65,32 @@ class SysmonCollector:
         return None
 
     def _save_bookmark(self, event_handle):
+        temp_path = None
         try:
             bm = win32evtlog.EvtCreateBookmark(None)
             win32evtlog.EvtUpdateBookmark(bm, event_handle)
             xml = win32evtlog.EvtRender(bm, win32evtlog.EvtRenderBookmark)
-            with open(self.bookmark_file, "w", encoding="utf-8") as f:
+            bookmark_path = os.path.abspath(self.bookmark_file)
+            bookmark_dir = os.path.dirname(bookmark_path)
+            os.makedirs(bookmark_dir, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=bookmark_dir,
+                prefix=os.path.basename(bookmark_path) + ".", suffix=".tmp", delete=False,
+            ) as f:
+                temp_path = f.name
                 f.write(xml)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, bookmark_path)
         except Exception as ex:
             log.warning("Không lưu được bookmark: %s", ex)
+
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
 
     def _subscribe(self):
         if self._signal_event is None:

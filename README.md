@@ -1,6 +1,6 @@
 # EDR Agent - gửi Sysmon logs lên XDR
 
-Agent đọc sự kiện từ `Microsoft-Windows-Sysmon/Operational`, gom thành batch và gửi tới API XDR `POST /api/events/batch`. Khi mất kết nối, event được giữ trong `spool.jsonl` để gửi lại. XDR lưu event vào SQLite; cảnh báo chỉ được tạo nếu event khớp rule đã cấu hình.
+Agent đọc sự kiện từ `Microsoft-Windows-Sysmon/Operational`, ghi event bền vững vào `spool.jsonl`, rồi gửi theo batch tới API XDR `POST /api/events/batch`. Bookmark chỉ tiến sau khi event đã được ghi xuống spool. XDR lưu event vào SQLite; cảnh báo chỉ được tạo nếu event khớp rule đã cấu hình.
 
 ## Điều kiện
 
@@ -126,6 +126,6 @@ filters:
 | Không thấy event | Kiểm tra Sysmon có ghi event mới trong Event Viewer → Applications and Services Logs → Microsoft → Windows → Sysmon → Operational. |
 | Thiếu `win32evtlog` | Kích hoạt virtualenv EDR rồi cài lại requirements; đảm bảo đang chạy trên Windows. |
 
-Khi XDR tạm thời không truy cập được, EDR sẽ retry rồi ghi event vào `spool.jsonl`; agent tự gửi lại khi kết nối được. Dừng agent bằng `Ctrl+C` để cố flush batch cuối.
+Khi XDR tạm thời không truy cập được, event vẫn được ghi và đồng bộ xuống `spool.jsonl`; agent tự gửi lại khi kết nối được. `sender.max_spool_mb` mặc định là `1024`. Khi spool đầy, agent dừng thay vì tiến bookmark qua event chưa lưu; giải phóng dung lượng rồi khởi động lại để đọc tiếp. Dừng agent bằng `Ctrl+C` để thử gửi phần queue còn lại.
 
 > Đây là prototype phục vụ demo/lab. Khóa mẫu trong hướng dẫn không phù hợp môi trường production; hãy thay bằng khóa ngẫu nhiên riêng và chỉ triển khai trên mạng tin cậy hoặc bảo vệ API bằng HTTPS.

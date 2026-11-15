@@ -1,17 +1,11 @@
-"""
-sender.py — Gửi event lên XDR server qua HTTP API, có xử lý lỗi kết nối.
-
-Cơ chế:
-- Gom event theo lô (batch) rồi POST JSON.
-- Nếu gửi thất bại (server sập/mạng lỗi): thử lại max_retries lần, vẫn hỏng thì
-  cất lô vào hàng đợi đĩa (spool.jsonl). Mỗi chu kỳ flush sẽ thử gửi lại hàng đợi.
-=> Không mất dữ liệu khi XDR server tạm thời không truy cập được (yêu cầu Tuần 3).
-"""
+"""Durable batch sender for the XDR ingestion API."""
 import json
 import logging
 import os
+import tempfile
 import threading
 import time
+from pathlib import Path
 
 import requests
 
@@ -20,17 +14,17 @@ log = logging.getLogger("edr.sender")
 
 class Sender:
     def __init__(self, url, agent_id, agent_key, queue_file,
-                 batch_size=20, flush_interval=3, max_retries=3, timeout=5):
+                 batch_size=20, flush_interval=3, max_retries=3, timeout=5,
+                 max_spool_mb=1024):
         self.url = url
         self.agent_id = agent_id
-        self.agent_key = agent_key
-        self.queue_file = queue_file
-        self.batch_size = batch_size
-        self.flush_interval = flush_interval
-        self.max_retries = max_retries
-        self.timeout = timeout
+        self.queue_file = Path(queue_file)
+        self.batch_size = max(1, int(batch_size))
+        self.flush_interval = max(0.1, float(flush_interval))
+        self.max_retries = max(1, int(max_retries))
+        self.timeout = max(0.1, float(timeout))
+        self.max_spool_bytes = max(1, int(float(max_spool_mb) * 1024 * 1024))
 
-        self._buffer = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._session = requests.Session()
@@ -39,87 +33,100 @@ class Sender:
             "X-Agent-Id": agent_id,
             "X-Agent-Key": agent_key,
         })
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread = threading.Thread(target=self._loop, name="edr-sender", daemon=True)
 
-    # ---- API công khai ----
     def start(self):
         self._thread.start()
 
     def stop(self):
         self._stop.set()
-        self._thread.join(timeout=self.flush_interval + self.timeout)
-        self._flush()  # cố gắng gửi nốt trước khi thoát
+        retry_budget = self.max_retries * (self.timeout + 10) + self.flush_interval + 2
+        self._thread.join(timeout=retry_budget)
+        if self._thread.is_alive():
+            log.error("Sender is still draining the durable spool; queued events remain on disk.")
 
     def enqueue(self, event):
-        """Gắn metadata agent rồi đưa event vào buffer."""
+        """Persist an event before returning, so the collector may safely advance its bookmark."""
         event["agent_id"] = self.agent_id
+        line = (json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        self.queue_file.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
-            self._buffer.append(event)
-            if len(self._buffer) >= self.batch_size:
-                batch, self._buffer = self._buffer, []
-                self._send_or_spool(batch)
+            current_size = self.queue_file.stat().st_size if self.queue_file.exists() else 0
+            if current_size + len(line) > self.max_spool_bytes:
+                raise OSError(
+                    f"EDR spool limit reached ({self.max_spool_bytes} bytes); "
+                    "event was not acknowledged to the collector"
+                )
+            with self.queue_file.open("ab") as spool:
+                spool.write(line)
+                spool.flush()
+                os.fsync(spool.fileno())
 
-    # ---- Nội bộ ----
     def _loop(self):
-        while not self._stop.is_set():
-            time.sleep(self.flush_interval)
-            self._flush()
+        while not self._stop.wait(self.flush_interval):
             self._drain_spool()
-
-    def _flush(self):
-        with self._lock:
-            if not self._buffer:
-                return
-            batch, self._buffer = self._buffer, []
-        self._send_or_spool(batch)
+        # Final best-effort attempt; failures stay on disk for the next start.
+        self._drain_spool()
 
     def _post(self, batch):
-        """Trả True nếu server nhận thành công."""
         for attempt in range(1, self.max_retries + 1):
             try:
-                r = self._session.post(self.url, data=json.dumps(batch),
-                                       timeout=self.timeout)
-                if 200 <= r.status_code < 300:
+                response = self._session.post(self.url, json=batch, timeout=self.timeout)
+                if 200 <= response.status_code < 300:
                     return True
-                log.warning("Server trả %s (lần %s)", r.status_code, attempt)
-            except requests.RequestException as ex:
-                log.warning("Lỗi kết nối XDR (lần %s/%s): %s",
-                            attempt, self.max_retries, ex)
-            time.sleep(min(2 ** attempt, 10))  # backoff
+                log.warning("XDR returned HTTP %s (attempt %s/%s)",
+                            response.status_code, attempt, self.max_retries)
+            except requests.RequestException as exc:
+                log.warning("XDR connection failed (attempt %s/%s): %s",
+                            attempt, self.max_retries, exc)
+            if attempt < self.max_retries:
+                time.sleep(min(2 ** attempt, 10))
         return False
 
-    def _send_or_spool(self, batch):
-        if not batch:
-            return
-        if self._post(batch):
-            log.info("Đã gửi %s event tới XDR.", len(batch))
-        else:
-            self._spool(batch)
-            log.error("Không gửi được, đã cất %s event vào hàng đợi đĩa.", len(batch))
-
-    def _spool(self, batch):
-        with open(self.queue_file, "a", encoding="utf-8") as f:
-            for ev in batch:
-                f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+    def _replace_spool(self, events):
+        """Atomically replace the queue after successful batches have been acknowledged."""
+        self.queue_file.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self.queue_file.parent,
+                prefix=f"{self.queue_file.name}.", suffix=".tmp", delete=False,
+            ) as temp_file:
+                temp_path = Path(temp_file.name)
+                for event in events:
+                    temp_file.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+            os.replace(temp_path, self.queue_file)
+        finally:
+            if temp_path is not None and temp_path.exists():
+                temp_path.unlink()
 
     def _drain_spool(self):
-        """Thử gửi lại các event đang nằm trong hàng đợi đĩa."""
-        if not os.path.exists(self.queue_file) or os.path.getsize(self.queue_file) == 0:
-            return
-        with open(self.queue_file, "r", encoding="utf-8") as f:
-            lines = [l for l in f if l.strip()]
-        if not lines:
-            return
-        events = [json.loads(l) for l in lines]
-        # gửi theo lô
-        remaining = []
-        for i in range(0, len(events), self.batch_size):
-            batch = events[i:i + self.batch_size]
-            if not self._post(batch):
-                remaining.extend(batch)  # còn hỏng -> giữ lại
-        # ghi lại phần chưa gửi được (rỗng nếu đã sạch hàng đợi)
-        with open(self.queue_file, "w", encoding="utf-8") as f:
-            for ev in remaining:
-                f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-        if not remaining:
-            log.info("Đã gửi hết hàng đợi đĩa, XDR đã nhận lại dữ liệu tồn.")
+        # Keep the lock through send + atomic rewrite so concurrent appends cannot be lost.
+        with self._lock:
+            if not self.queue_file.exists() or self.queue_file.stat().st_size == 0:
+                return
+            try:
+                with self.queue_file.open("r", encoding="utf-8") as spool:
+                    events = [json.loads(line) for line in spool if line.strip()]
+            except (OSError, json.JSONDecodeError) as exc:
+                log.error("Cannot read EDR spool; preserving it for recovery: %s", exc)
+                return
+
+            remaining = []
+            sent = 0
+            for offset in range(0, len(events), self.batch_size):
+                batch = events[offset:offset + self.batch_size]
+                if self._post(batch):
+                    sent += len(batch)
+                else:
+                    remaining.extend(batch)
+            try:
+                self._replace_spool(remaining)
+            except OSError:
+                # If the rewrite fails, the original spool is still intact unless replace completed.
+                log.exception("Could not update EDR spool after sending")
+                return
+            if sent:
+                log.info("XDR acknowledged %s queued events; %s remain", sent, len(remaining))
