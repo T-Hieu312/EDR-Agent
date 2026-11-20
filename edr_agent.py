@@ -19,6 +19,7 @@ import yaml
 from sender import Sender
 from sysmon_collector import SysmonCollector
 from event_filter import EventFilter
+from response_worker import ResponseWorker
 
 
 def setup_logging(cfg):
@@ -68,6 +69,11 @@ def main():
         timeout=s["timeout"], max_spool_mb=s.get("max_spool_mb", 1024),
     )
     sender.start()
+    response_worker = ResponseWorker(
+        ingest_url=s["url"], agent_id=agent_id, agent_key=agent_key,
+        host_id=socket.gethostname(), interval=cfg.get("response", {}).get("poll_interval", 5),
+    )
+    response_worker.start()
 
     c = cfg["collector"]
     event_filter = EventFilter(cfg.get("filters", {}))
@@ -79,6 +85,7 @@ def main():
     # Thoát êm khi Ctrl+C
     def _graceful(_sig, _frm):
         log.info("Nhận tín hiệu dừng, flush dữ liệu còn lại...")
+        response_worker.stop()
         sender.stop()
         sys.exit(0)
     signal.signal(signal.SIGINT, _graceful)
@@ -99,6 +106,7 @@ def main():
                 log.info("Đã thu thập %s sự kiện.", count)
     except Exception as ex:
         log.exception("Collector dừng bất thường: %s", ex)
+        response_worker.stop()
         sender.stop()
         sys.exit(1)
 

@@ -28,6 +28,9 @@ sender:
   timeout: 5
   max_spool_mb: 1024
 
+response:
+  poll_interval: 5
+
 storage:
   queue_file: "spool.jsonl"
   bookmark_file: "bookmark.xml"

@@ -1,5 +1,11 @@
 # EDR Agent - gửi Sysmon logs lên XDR
 
+Agent cũng poll `GET /api/agent/commands` bằng cùng thông tin xác thực. Lệnh chỉ
+được phát sau khi admin khác người tạo đã duyệt. Agent có thể dừng PID, thêm luật
+Windows Firewall để chặn IP hai chiều, cô lập host bằng firewall (vẫn cho phép
+địa chỉ XDR) và khôi phục firewall bằng yêu cầu riêng. Chạy PowerShell/agent với
+quyền Administrator để firewall và kết thúc process hoạt động. Chỉ thử trong VM/lab.
+
 Agent đọc sự kiện từ `Microsoft-Windows-Sysmon/Operational`, ghi event bền vững vào `spool.jsonl`, rồi gửi theo batch tới API XDR `POST /api/events/batch`. Bookmark chỉ tiến sau khi event đã được ghi xuống spool. XDR lưu event vào SQLite; cảnh báo chỉ được tạo nếu event khớp rule đã cấu hình.
 
 ## Điều kiện
