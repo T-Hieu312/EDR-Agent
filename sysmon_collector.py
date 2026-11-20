@@ -142,14 +142,20 @@ class SysmonCollector:
             try:
                 events = win32evtlog.EvtNext(sub, 50)
             except Exception as ex:
-                # Hết event trong hàng đợi -> nghỉ rồi quét tiếp
-                if getattr(ex, "winerror", None) == 259:  # ERROR_NO_MORE_ITEMS
-                    win32event.WaitForSingleObject(
-                        self._signal_event, int(self.poll_interval * 1000))
+                # 259 = ERROR_NO_MORE_ITEMS; 4317 = ERROR_INVALID_OPERATION, which pywin32
+                # raises when EvtNext is called again before the subscription signals.
+                if getattr(ex, "winerror", None) in (259, 4317):
+                    events = ()
+                else:
+                    log.error("Lỗi đọc Event Log, thử lại: %s", ex)
+                    time.sleep(self.poll_interval)
+                    sub = self._subscribe()
                     continue
-                log.error("Lỗi đọc Event Log, thử lại: %s", ex)
-                time.sleep(self.poll_interval)
-                sub = self._subscribe()
+
+            if not events:
+                # Hết event trong hàng đợi -> chờ Windows báo có event mới rồi đọc tiếp
+                win32event.WaitForSingleObject(
+                    self._signal_event, int(self.poll_interval * 1000))
                 continue
 
             for ev in events:
